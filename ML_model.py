@@ -3,7 +3,7 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import confusion_matrix, classification_report, f1_score
 from sklearn.utils import class_weight
 import tensorflow as tf
@@ -17,7 +17,7 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-IMG_SIZE = 128                 # Größere Bilder für mehr Details
+IMG_SIZE = 128
 EPOCHS = 30
 BATCH_SIZE = 32
 NUM_FOLDS = 5
@@ -42,7 +42,7 @@ def load_images_from_folder(folder, label, img_size):
             img_path = os.path.join(folder, filename)
             try:
                 with Image.open(img_path) as img:
-                    img = img.convert('L')               # grayscale
+                    img = img.convert('L')
                     img = img.resize((img_size, img_size))
                     img_np = np.array(img, dtype=np.float32)
                     images.append(img_np)
@@ -104,11 +104,11 @@ def plot_and_save_history(history, fold, outdir=PLOTS_DIR):
             print(f"Saved {path}")
 
 # ---------------- Load dataset ----------------
-images_open, labels_open = load_images_from_folder(DATA_PATHS['open'], label=1, img_size=IMG_SIZE)
+images_open, labels_open   = load_images_from_folder(DATA_PATHS['open'],   label=1, img_size=IMG_SIZE)
 images_closed, labels_closed = load_images_from_folder(DATA_PATHS['closed'], label=0, img_size=IMG_SIZE)
 
 if len(images_open) + len(images_closed) == 0:
-    raise SystemExit("No images found in specified data folders. Please check DATA_PATHS and files.")
+    raise SystemExit("No images found in specified data folders.")
 
 X = np.array(images_open + images_closed, dtype=np.float32) / 255.0
 y = np.array(labels_open + labels_closed, dtype=np.int32)
@@ -116,28 +116,32 @@ X = X.reshape(-1, IMG_SIZE, IMG_SIZE, 1)
 
 print(f"Total samples: {len(X)} (open={sum(y==1)}, closed={sum(y==0)})")
 
-# ---------------- K-Fold Cross-Validation ----------------
-kf = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+# ---- Shuffle BEFORE K-Fold ----
+indices = np.arange(len(X))
+np.random.shuffle(indices)
+X = X[indices]
+y = y[indices]
+
+# ---------------- Stratified K-Fold ----------------
+kf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+
 fold = 1
 accuracies, aucs, precisions, recalls, f1s = [], [], [], [], []
 best_val_auc = -1.0
 overall_y_true, overall_y_pred = [], []
 
-for train_idx, val_idx in kf.split(X):
+for train_idx, val_idx in kf.split(X, y):
+
     print(f"\n--- Fold {fold}/{NUM_FOLDS} ---")
     X_train, X_val = X[train_idx], X[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
 
     # Class weights
-    try:
-        cw = class_weight.compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-        class_weights = {i: cw_val for i, cw_val in enumerate(cw)}
-        print(f"Class weights: {class_weights}")
-    except Exception as e:
-        class_weights = None
-        print(f"Could not compute class weights ({e}), proceeding without them.")
+    cw = class_weight.compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weights = {i: cw_val for i, cw_val in enumerate(cw)}
+    print(f"Class weights: {class_weights}")
 
-    # Data augmentation
+    # Augmentation
     datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rotation_range=10,
         width_shift_range=0.08,
@@ -149,7 +153,7 @@ for train_idx, val_idx in kf.split(X):
     )
     datagen.fit(X_train, seed=SEED)
 
-    # Build model
+    # Model
     model = build_model(input_shape=(IMG_SIZE, IMG_SIZE, 1))
 
     # Callbacks
@@ -167,17 +171,16 @@ for train_idx, val_idx in kf.split(X):
         verbose=1
     )
 
-    # Predict & Threshold optional
-    y_val_pred_prob = model.predict(X_val, batch_size=BATCH_SIZE, verbose=0).ravel()
-    threshold = 0.5  # kann bei Bedarf z.B. auf 0.4 angepasst werden
-    y_val_pred = (y_val_pred_prob >= threshold).astype(int)
+    # Predict
+    y_val_prob = model.predict(X_val, batch_size=BATCH_SIZE, verbose=0).ravel()
+    y_val_pred = (y_val_prob >= 0.5).astype(int)
 
-    overall_y_true.extend(list(y_val))
-    overall_y_pred.extend(list(y_val_pred))
+    overall_y_true.extend(y_val)
+    overall_y_pred.extend(y_val_pred)
 
     # Metrics
     fold_acc = np.mean(y_val_pred == y_val)
-    fold_auc = tf.keras.metrics.AUC()(y_val, y_val_pred_prob).numpy()
+    fold_auc = tf.keras.metrics.AUC()(y_val, y_val_prob).numpy()
     fold_precision = tf.keras.metrics.Precision()(y_val, y_val_pred).numpy()
     fold_recall = tf.keras.metrics.Recall()(y_val, y_val_pred).numpy()
     fold_f1 = f1_score(y_val, y_val_pred, zero_division=0)
@@ -201,13 +204,13 @@ for train_idx, val_idx in kf.split(X):
         np.save(os.path.join(PLOTS_DIR, 'best_fold_confusion_matrix.npy'), cm)
         with open(os.path.join(PLOTS_DIR, 'best_fold_classification_report.txt'), 'w') as f:
             f.write(cr)
-        print("Saved best fold confusion matrix and classification report.")
 
-    # Save fold metrics & plots
+    # Save fold data
     cm_fold = confusion_matrix(y_val, y_val_pred)
     np.save(os.path.join(PLOTS_DIR, f'fold_{fold}_confusion_matrix.npy'), cm_fold)
     with open(os.path.join(PLOTS_DIR, f'fold_{fold}_classification_report.txt'), 'w') as f:
         f.write(classification_report(y_val, y_val_pred, target_names=['Closed', 'Open']))
+
     plot_and_save_history(history, fold)
 
     K.clear_session()
@@ -228,6 +231,6 @@ print(f"Overall F1: {overall_f1:.4f}")
 np.save(os.path.join(PLOTS_DIR, 'overall_confusion_matrix.npy'), overall_cm)
 with open(os.path.join(PLOTS_DIR, 'overall_classification_report.txt'), 'w') as f:
     f.write(overall_cr)
-print(f"Saved overall confusion matrix and classification report in: {PLOTS_DIR}")
-print(f"\nBest model (by val AUC) saved at: {MODEL_SAVE_PATH}")
+
+print(f"\nBest model saved at: {MODEL_SAVE_PATH}")
 print("Done.")
